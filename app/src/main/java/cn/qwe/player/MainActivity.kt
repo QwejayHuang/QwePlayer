@@ -330,17 +330,31 @@ fun Modifier.voicePressHandler(
     onPressStart: () -> Unit,
     onPressEnd: () -> Unit
 ): Modifier = this.pointerInput(Unit) {
+    var lastTriggerTime = 0L
+    val debounceMs = 400L
+
     awaitEachGesture {
         val down = awaitFirstDown(requireUnconsumed = false)
         down.consume()
-        onPressStart()
+
+        val now = System.currentTimeMillis()
+        val isValidPress = (now - lastTriggerTime) > debounceMs
+
+        if (isValidPress) {
+            onPressStart()
+            lastTriggerTime = now
+        }
+
         var isDown = true
         while (isDown) {
             val event = awaitPointerEvent()
             val anyPressed = event.changes.any { it.pressed }
             if (!anyPressed) {
                 isDown = false
-                onPressEnd()
+                if (isValidPress) {
+                    onPressEnd()
+                    lastTriggerTime = System.currentTimeMillis()
+                }
             } else {
                 event.changes.forEach { it.consume() }
             }
@@ -629,7 +643,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     private var virtualizer: Virtualizer? = null
 
     var duplicateSongsToResolve by mutableStateOf<List<Song>>(emptyList())
-    var duplicateSelectionCountdown by mutableStateOf(3)
+    var duplicateSelectionCountdown by mutableStateOf(8)
     private var selectionCountdownJob: Job? = null
     private var selectionResolutionCallback: ((Song) -> Unit)? = null
 
@@ -1075,17 +1089,25 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
         fadeJob = viewModelScope.launch {
             if (isPlaying) { for (i in 10 downTo 0) { exoPlayer?.volume = i / 10f; delay(15) } }
             exoPlayer?.volume = 0f
-            if (currentQueue != queue) {
-                currentQueue = queue
-                exoPlayer?.setMediaItems(queue.map { s: Song -> MediaItem.fromUri(s.uri) })
+
+            var targetQueue = queue
+            var index = targetQueue.indexOfFirst { s: Song -> s.id == song.id }
+
+            if (index == -1) {
+                targetQueue = listOf(song)
+                index = 0
+            }
+
+            if (currentQueue != targetQueue) {
+                currentQueue = targetQueue
+                exoPlayer?.setMediaItems(targetQueue.map { s: Song -> MediaItem.fromUri(s.uri) })
                 exoPlayer?.prepare()
             }
-            val index = queue.indexOfFirst { s: Song -> s.id == song.id }
-            if (index != -1) {
-                exoPlayer?.seekTo(index, 0L)
-                exoPlayer?.play()
-                updateNextSong()
-            }
+
+            exoPlayer?.seekTo(index, 0L)
+            exoPlayer?.play()
+            updateNextSong()
+
             for (i in 1..10) { exoPlayer?.volume = i / 10f; delay(15) }
             exoPlayer?.volume = 1f
         }
@@ -1308,7 +1330,7 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
     fun presentSongSelection(matches: List<Song>, onResolved: (Song) -> Unit) {
         selectionCountdownJob?.cancel()
         duplicateSongsToResolve = matches
-        duplicateSelectionCountdown = 3
+        duplicateSelectionCountdown = 8
         selectionResolutionCallback = onResolved
         selectionCountdownJob = viewModelScope.launch {
             while (duplicateSelectionCountdown > 0) {
@@ -1333,20 +1355,26 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun findDuplicateSongMatches(clean: String): List<Song> {
         val searchList = songList
+
         val exact = searchList.filter { s -> s.title.lowercase() == clean }
         if (exact.isNotEmpty()) return exact
 
-        val contain = searchList.filter { s -> s.title.lowercase().contains(clean) || s.artist.lowercase().contains(clean) }
-        if (contain.isNotEmpty()) return contain.take(3)
+        val contain = searchList.filter { s ->
+            s.title.lowercase().contains(clean) || s.artist.lowercase().contains(clean)
+        }
+        if (contain.isNotEmpty()) {
+            return contain.sortedBy { abs(it.title.length - clean.length) }.take(5)
+        }
 
         val matched = mutableListOf<Pair<Song, Int>>()
         for (song in searchList) {
             val dist = minOf(levenshteinDistance(clean, song.title.lowercase()), levenshteinDistance(clean, song.artist.lowercase()))
-            if (dist <= maxOf(1, clean.length / 3 + 1)) {
+            val threshold = maxOf(1, clean.length / 4)
+            if (dist <= threshold) {
                 matched.add(song to dist)
             }
         }
-        return matched.sortedBy { it.second }.map { it.first }.take(3)
+        return matched.sortedBy { it.second }.map { it.first }.take(5)
     }
 
     private fun cleanVoiceInput(text: String): String {
@@ -1528,10 +1556,19 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                                 levenshteinDistance(songSpecificKeyword, s.title.lowercase()) <= maxOf(1, songSpecificKeyword.length / 3)
                     }
                     if (specificMatches.isNotEmpty()) {
-                        val targetSong = specificMatches.first()
-                        val targetMode = if (isSingleLoopIntent) PlayMode.REPEAT_ONE else if (isShuffleIntent) PlayMode.SHUFFLE else PlayMode.SEQUENCE
-                        setVoiceQueueAndPlay(artistSongs, targetSong, targetMode)
-                        voiceFeedback = "正在${if (isSingleLoopIntent) "单曲循环" else "播放"} ${matchedArtist} 的 《${targetSong.title}》"
+                        if (specificMatches.size == 1) {
+                            val targetSong = specificMatches.first()
+                            val targetMode = if (isSingleLoopIntent) PlayMode.REPEAT_ONE else if (isShuffleIntent) PlayMode.SHUFFLE else PlayMode.SEQUENCE
+                            setVoiceQueueAndPlay(artistSongs, targetSong, targetMode)
+                            voiceFeedback = "正在${if (isSingleLoopIntent) "单曲循环" else "播放"} ${matchedArtist} 的 《${targetSong.title}》"
+                        } else {
+                            voiceFeedback = "找到 ${matchedArtist} 的多首同名歌曲，请选择"
+                            val sortedMatches = specificMatches.sortedBy { abs(it.title.length - songSpecificKeyword.length) }.take(5)
+                            presentSongSelection(sortedMatches) { target ->
+                                val targetMode = if (isSingleLoopIntent) PlayMode.REPEAT_ONE else if (isShuffleIntent) PlayMode.SHUFFLE else PlayMode.SEQUENCE
+                                setVoiceQueueAndPlay(artistSongs, target, targetMode)
+                            }
+                        }
                         return
                     }
                 }
@@ -1577,17 +1614,27 @@ class MusicViewModel(application: Application) : AndroidViewModel(application) {
                     val targetMode = if (isSingleLoopIntent) PlayMode.REPEAT_ONE else null
                     voiceFeedback = "即将播放: ${target.title}"
                     if (targetMode != null) switchPlayMode(targetMode)
+
                     val activeList = getFilteredAllSongs()
-                    playSong(target, activeList, "全部歌曲")
-                    requestedTab = "全部歌曲"
+                    if (activeList.any { it.id == target.id }) {
+                        playSong(target, activeList, "全部歌曲")
+                        requestedTab = "全部歌曲"
+                    } else {
+                        setVoiceQueueAndPlay(listOf(target), target, targetMode ?: PlayMode.SEQUENCE)
+                    }
                 } else {
                     voiceFeedback = "找到多首同名歌曲，请选择"
                     presentSongSelection(targets) { target ->
                         val targetMode = if (isSingleLoopIntent) PlayMode.REPEAT_ONE else null
                         if (targetMode != null) switchPlayMode(targetMode)
+
                         val activeList = getFilteredAllSongs()
-                        playSong(target, activeList, "全部歌曲")
-                        requestedTab = "全部歌曲"
+                        if (activeList.any { it.id == target.id }) {
+                            playSong(target, activeList, "全部歌曲")
+                            requestedTab = "全部歌曲"
+                        } else {
+                            setVoiceQueueAndPlay(listOf(target), target, targetMode ?: PlayMode.SEQUENCE)
+                        }
                     }
                 }
             }
@@ -2050,7 +2097,7 @@ fun DuplicateSongChoiceDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "系统将在 3 秒后默认播放推荐匹配的一首歌曲。",
+                    text = "系统将在倒计时结束后默认播放第一首歌曲。",
                     color = textSub,
                     fontSize = 12.sp,
                     modifier = Modifier.padding(bottom = 6.dp)
@@ -2271,7 +2318,7 @@ fun SharedPlaybackControls(vm: MusicViewModel, textMain: Color, textSub: Color, 
         Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                    .size(64.dp)
+                    .size(80.dp)
                     .clip(CircleShape)
                     .background(Color.Transparent)
                     .voicePressHandler(
@@ -2288,10 +2335,11 @@ fun SharedPlaybackControls(vm: MusicViewModel, textMain: Color, textSub: Color, 
                         VoiceState.RECOGNIZING -> Color(0xFF4CAF50)
                         else -> textMain
                     },
-                    modifier = Modifier.size(34.dp)
+                    modifier = Modifier.size(36.dp)
                 )
             }
-            Spacer(Modifier.width(18.dp))
+            Spacer(Modifier.width(10.dp))
+
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
                 RoundControlButton(onClick = { vm.prevMusic() }, modifier = Modifier.size(60.dp)) { Icon(Icons.Rounded.SkipPrevious, null, tint = textMain, modifier = Modifier.size(36.dp)) }
 
@@ -2895,7 +2943,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                 LazyColumn(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     item {
                         when (selectedTab) {
-                            0 -> { // 播放
+                            0 -> {
                                 SettingsCardSection("启动与播放行为", textMain) {
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Column(modifier = Modifier.weight(1f)) { Text("启动继续播放", color = textMain, fontSize = 16.sp, fontWeight = FontWeight.Bold); Text("恢复上次未播完的歌曲与进度", color = textSub, fontSize = 13.sp) }
@@ -2934,7 +2982,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                                     }
                                 }
                             }
-                            1 -> { // 显示
+                            1 -> {
                                 SettingsCardSection("界面与显示", textMain) {
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Column(modifier = Modifier.weight(1f)) { Text("横屏默认布局", color = textMain, fontSize = 16.sp, fontWeight = FontWeight.Bold); Text("决定启动时是展示列表模式或沉浸模式", color = textSub, fontSize = 13.sp) }
@@ -2953,7 +3001,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                                     }
                                 }
                             }
-                            2 -> { // 媒体库
+                            2 -> { 
                                 SettingsCardSection("库状态与操作", textMain) {
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Column(modifier = Modifier.weight(1f)) {
@@ -3051,7 +3099,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                                     }
                                 }
                             }
-                            3 -> { // 歌词
+                            3 -> {
                                 SettingsCardSection("歌词元数据编辑", textMain) {
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
@@ -3101,7 +3149,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                                     SettingsSliderRow("歌词行距", "${vm.lrcSpacing.toInt()}pt", vm.lrcSpacing, 0f..40f, { value: Float -> vm.updateSetting("lrcSpacing", value) }, textMain, textSub, panelColor)
                                 }
                             }
-                            4 -> { // 音效
+                            4 -> {
                                 SettingsCardSection("全局声场控制", textMain) {
                                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                                         Column(modifier = Modifier.weight(1f)) { Text("统一歌曲音量", color = textMain, fontSize = 16.sp, fontWeight = FontWeight.Bold); Text("自动平衡不同平台下载歌曲的音量大小差异", color = textSub, fontSize = 13.sp) }
@@ -3147,7 +3195,7 @@ fun SettingsPanel(vm: MusicViewModel, show: Boolean, onDismiss: () -> Unit, pane
                                     }
                                 }
                             }
-                            5 -> { // 关于
+                            5 -> {
                                 Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
                                     Box(Modifier.size(80.dp).clip(RoundedCornerShape(20.dp)).background(textMain.copy(0.08f)), contentAlignment = Alignment.Center) {
                                         Icon(Icons.Rounded.MusicNote, contentDescription = null, tint = textMain, modifier = Modifier.size(48.dp))
